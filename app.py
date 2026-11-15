@@ -7,7 +7,8 @@ Setup
 2. Spotify: create an app at https://developer.spotify.com/dashboard and add the Redirect URI
    http://127.0.0.1:5000/callback  (or https://YOUR-APP-URL/callback once hosted)
 3. Set SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET. Optional: REDIRECT_URI, FLASK_SECRET,
-   COOKIES_FILE (browser cookies, helps with Instagram), MAX_SAMPLES (default 8).
+   COOKIES_FILE (path to a Netscape cookies.txt; needed for most Instagram reels),
+   MAX_SAMPLES (default 8), MAX_UPLOAD_MB (default 100).
 4. Recognition is free via Shazam (shazamio, no key). If AUDD_API_TOKEN is set, AudD is used instead.
 5. python app.py -> http://127.0.0.1:5000
 """
@@ -21,6 +22,7 @@ import tempfile
 import wave
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 import requests
 import spotipy
@@ -38,7 +40,12 @@ WINDOW_SECS, STEP_SECS, MAX_AUDIO_SECS = 10, 15, 300
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET") or secrets.token_hex(16)
 app.permanent_session_lifetime = timedelta(days=60)
-app.config.update(SESSION_COOKIE_SECURE=REDIRECT_URI.startswith("https"), SESSION_COOKIE_SAMESITE="Lax")
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", 100))
+app.config.update(
+    SESSION_COOKIE_SECURE=REDIRECT_URI.startswith("https"),
+    SESSION_COOKIE_SAMESITE="Lax",
+    MAX_CONTENT_LENGTH=MAX_UPLOAD_MB * 1024 * 1024,
+)
 
 
 def oauth():
@@ -52,8 +59,35 @@ def spotify():
     return spotipy.Spotify(auth_manager=auth)
 
 
+def to_wav(src, folder):
+    """Convert any audio/video file to 16 kHz mono wav (first few minutes only)."""
+    wav = Path(folder) / "clip.wav"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(src), "-vn", "-t", str(MAX_AUDIO_SECS), "-ar", "16000", "-ac", "1", str(wav)],
+        check=True, capture_output=True,
+    )
+    return wav
+
+
+def clean_url(url):
+    u = urlparse(url)
+    if "instagram.com" in u.netloc:  # drop tracking params like ?igsh=
+        return urlunparse(u._replace(query="", fragment=""))
+    return url
+
+
+def explain(url, err):
+    msg = str(err)
+    low = msg.lower()
+    if "instagram" in url and any(k in low for k in ("login", "cookies", "rate-limit", "empty media", "not available")):
+        return ("Instagram blocked the download (it usually requires being logged in). "
+                "Add Instagram cookies on the server, or screen-record the reel and use the Upload tab.")
+    return msg[:300]
+
+
 def fetch_audio(url, folder):
-    """Fetch the video's audio (kept only in a temp folder) and convert to 16 kHz mono wav."""
+    """Fetch a video's audio into a temp folder and convert it to wav."""
+    url = clean_url(url)
     opts = {
         "format": "bestaudio/best",
         "outtmpl": str(Path(folder) / "src.%(ext)s"),
@@ -61,19 +95,21 @@ def fetch_audio(url, folder):
         "quiet": True,
         "match_filter": match_filter_func("duration < 900"),
     }
-    if os.environ.get("COOKIES_FILE"):
-        opts["cookiefile"] = os.environ["COOKIES_FILE"]
-    with YoutubeDL(opts) as ydl:
-        ydl.download([url])
+    cookies = os.environ.get("COOKIES_FILE")
+    if cookies and Path(cookies).is_file():
+        # yt-dlp rewrites its cookie file, and hosts mount secret files read-only, so use a copy
+        copy = Path(folder) / "cookies.txt"
+        copy.write_text(Path(cookies).read_text())
+        opts["cookiefile"] = str(copy)
+    try:
+        with YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        raise RuntimeError(explain(url, e)) from e
     sources = list(Path(folder).glob("src.*"))
     if not sources:
         raise RuntimeError("video is unavailable or longer than 15 minutes")
-    wav = Path(folder) / "clip.wav"
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(sources[0]), "-t", str(MAX_AUDIO_SECS), "-ar", "16000", "-ac", "1", str(wav)],
-        check=True, capture_output=True,
-    )
-    return wav
+    return to_wav(sources[0], folder)
 
 
 def slice_windows(wav_path):
@@ -163,32 +199,17 @@ def playlists():
     return jsonify(playlists=items)
 
 
-@app.route("/api/add", methods=["POST"])
-def add():
-    sp = spotify()
-    if not sp:
-        return jsonify(error="Connect Spotify first."), 401
-    body = request.get_json(force=True)
-    url, playlist_id = body.get("url", "").strip(), body.get("playlist_id")
-    if not url or not playlist_id:
-        return jsonify(error="Paste a video link and pick a playlist."), 400
-
+def identify_and_add(sp, playlist_id, wav):
+    clips = slice_windows(wav)
     hits, failures = {}, 0
-    with tempfile.TemporaryDirectory() as tmp:
+    for clip in clips:
         try:
-            clips = slice_windows(fetch_audio(url, tmp))
-        except subprocess.CalledProcessError:
-            return jsonify(error="That video has no audio I can read."), 422
-        except Exception as e:
-            return jsonify(error=f"Couldn't get that video: {str(e)[:200]}"), 422
-        for clip in clips:
-            try:
-                hit = recognize(clip)
-            except Exception:
-                failures += 1
-                continue
-            if hit:
-                hits.setdefault((hit["title"].lower(), hit["artist"].lower()), hit)
+            hit = recognize(clip)
+        except Exception:
+            failures += 1
+            continue
+        if hit:
+            hits.setdefault((hit["title"].lower(), hit["artist"].lower()), hit)
 
     if not hits:
         if failures == len(clips):
@@ -217,6 +238,48 @@ def add():
     return jsonify(results=results)
 
 
+@app.route("/api/add", methods=["POST"])
+def add():
+    sp = spotify()
+    if not sp:
+        return jsonify(error="Connect Spotify first."), 401
+    body = request.get_json(force=True)
+    url, playlist_id = body.get("url", "").strip(), body.get("playlist_id")
+    if not url or not playlist_id:
+        return jsonify(error="Paste a video link and pick a playlist."), 400
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            wav = fetch_audio(url, tmp)
+        except subprocess.CalledProcessError:
+            return jsonify(error="That video has no audio I can read."), 422
+        except Exception as e:
+            return jsonify(error=f"Couldn't get that video: {str(e)[:300]}"), 422
+        return identify_and_add(sp, playlist_id, wav)
+
+
+@app.route("/api/upload", methods=["POST"])
+def upload():
+    sp = spotify()
+    if not sp:
+        return jsonify(error="Connect Spotify first."), 401
+    video, playlist_id = request.files.get("video"), request.form.get("playlist_id")
+    if not video or not playlist_id:
+        return jsonify(error="Choose a file and a playlist."), 400
+    with tempfile.TemporaryDirectory() as tmp:  # deleted as soon as this request ends
+        src = Path(tmp) / "upload.bin"
+        video.save(src)
+        try:
+            wav = to_wav(src, tmp)
+        except subprocess.CalledProcessError:
+            return jsonify(error="I couldn't read audio from that file."), 422
+        return identify_and_add(sp, playlist_id, wav)
+
+
+@app.errorhandler(413)
+def too_big(_):
+    return jsonify(error=f"That file is too large (limit {MAX_UPLOAD_MB} MB)."), 413
+
+
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -238,23 +301,37 @@ input:focus,select:focus,button:focus-visible,.btn:focus-visible{outline:3px sol
 button,.btn{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;cursor:pointer;margin-top:1.4rem;display:block;text-align:center;text-decoration:none}
 button:disabled{opacity:.6;cursor:wait}
 #out{margin-top:1.4rem;min-height:3rem;font-family:system-ui,sans-serif}
-#out ul{list-style:none;margin:0;padding:0}
-#out li{padding:.7rem 0;border-top:1px solid var(--line)}
-#out li strong{display:block;font:1.2rem Georgia,serif}
+#out ul,#hl{list-style:none;margin:0;padding:0}
+#out li,#hl li{padding:.7rem 0;border-top:1px solid var(--line)}
+#out li strong,#hl li strong{display:block;font:1.2rem Georgia,serif}
 .ok{color:var(--ok)}.bad{color:var(--bad)}.mute{color:var(--mute)}
+.tabs{display:flex;gap:.5rem}.tab{margin:0;background:transparent;color:var(--ink);border-color:var(--line)}
+.tab.on{background:var(--accent);border-color:var(--accent);color:#fff}
+h2{font-size:1.4rem;margin:2.4rem 0 .4rem}#clear{margin-top:1rem;font-weight:400;color:var(--mute)}
 </style></head>
 <body><main>
 <h1>Song Grabber</h1>
 <p class="lead">Paste a video link. We find the songs in it and add them to your playlist.</p>
 <div id="connect" hidden><a class="btn" href="/login">Connect Spotify</a></div>
 <div id="app" hidden>
-  <label for="url">Video link</label>
-  <input id="url" type="url" placeholder="https://www.tiktok.com/@user/video/…" autocomplete="off">
+  <div class="tabs" role="tablist">
+    <button type="button" id="tab-link" class="tab on" role="tab" aria-selected="true">Link</button>
+    <button type="button" id="tab-file" class="tab" role="tab" aria-selected="false">Upload</button>
+  </div>
+  <div id="pane-link">
+    <label for="url">Video link</label>
+    <input id="url" type="url" placeholder="https://www.instagram.com/reel/…" autocomplete="off">
+  </div>
+  <div id="pane-file" hidden>
+    <label for="file">Video file (not stored; deleted right after listening)</label>
+    <input id="file" type="file" accept="video/*,audio/*">
+  </div>
   <label for="pl">Playlist</label>
   <select id="pl"></select>
   <button id="go">Find songs and add them</button>
 </div>
 <div id="out" role="status" aria-live="polite"></div>
+<section id="hist" hidden><h2>History</h2><ul id="hl"></ul><button type="button" id="clear" class="tab">Clear history</button></section>
 </main>
 <script>
 const $=id=>document.getElementById(id), out=$('out');
@@ -269,12 +346,43 @@ async function init(){
   const last=localStorage.getItem('pl'); if(last)$('pl').value=last;
   $('app').hidden=false;
 }
+let mode='link';
+function setMode(m){
+  mode=m; $('pane-link').hidden=m!=='link'; $('pane-file').hidden=m!=='file';
+  for(const [id,on] of [['tab-link',m==='link'],['tab-file',m==='file']]){
+    $(id).classList.toggle('on',on); $(id).setAttribute('aria-selected',on)}
+}
+$('tab-link').onclick=()=>setMode('link'); $('tab-file').onclick=()=>setMode('file');
+
+const loadHist=()=>{try{return JSON.parse(localStorage.getItem('history')||'[]')}catch(e){return[]}};
+function saveHist(list){try{localStorage.setItem('history',JSON.stringify(list.slice(0,500)))}catch(e){}}
+function renderHist(){
+  const h=loadHist(); $('hist').hidden=!h.length;
+  $('hl').replaceChildren(...h.map(x=>{
+    const li=document.createElement('li'), t=document.createElement('strong'), m=document.createElement('span');
+    t.textContent=x.title;
+    m.textContent=[x.artist,LABEL[x.status][0],x.playlist,x.source,new Date(x.at).toLocaleString()].join(' · ');
+    m.className='mute'; li.append(t,m); return li;
+  }));
+}
+$('clear').onclick=()=>{if(confirm('Clear the history on this device?')){saveHist([]);renderHist()}};
+
 $('go').onclick=async()=>{
-  const b=$('go'); b.disabled=true; say('Fetching the video and listening… this can take up to a minute.');
-  localStorage.setItem('pl',$('pl').value);
+  const b=$('go'), pl=$('pl'); b.disabled=true;
+  try{localStorage.setItem('pl',pl.value)}catch(e){}
   try{
-    const r=await fetch('/api/add',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({url:$('url').value,playlist_id:$('pl').value})});
+    let r;
+    if(mode==='file'){
+      const f=$('file').files[0]; if(!f)return say('Choose a video file first.','bad');
+      say('Uploading and listening… this can take up to a minute.');
+      const fd=new FormData(); fd.append('video',f); fd.append('playlist_id',pl.value);
+      r=await fetch('/api/upload',{method:'POST',body:fd});
+    }else{
+      if(!$('url').value.trim())return say('Paste a video link first.','bad');
+      say('Fetching the video and listening… this can take up to a minute.');
+      r=await fetch('/api/add',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({url:$('url').value,playlist_id:pl.value})});
+    }
     const d=await r.json();
     if(!r.ok)return say(d.error,'bad');
     const ul=document.createElement('ul');
@@ -283,10 +391,14 @@ $('go').onclick=async()=>{
       t.textContent=s.title; m.textContent=s.artist+' · '+LABEL[s.status][0]; m.className=LABEL[s.status][1];
       li.append(t,m); ul.append(li);
     }
-    out.className=''; out.replaceChildren(ul); $('url').value='';
+    out.className=''; out.replaceChildren(ul);
+    const src=mode==='file'?'upload':'link', plName=pl.selectedOptions[0].text, at=Date.now();
+    saveHist([...d.results.map(s=>({...s,source:src,playlist:plName,at})),...loadHist()]);
+    renderHist(); $('url').value=''; $('file').value='';
   }catch(e){say('Something went wrong. Check that the app is still running.','bad')}
   finally{b.disabled=false}
 };
+renderHist();
 init().then(()=>{
   const q=new URLSearchParams(location.search), m=((q.get('url')||'')+' '+(q.get('text')||'')).match(/https?:\/\/\S+/);
   if(!m)return;
