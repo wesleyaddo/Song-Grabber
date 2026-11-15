@@ -3,4 +3,4 @@ spotipy>=2.23
 requests
 gunicorn
 shazamio
-yt-dlp
+yt-dlp[default,curl-cffi]
