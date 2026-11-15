@@ -8,11 +8,12 @@ Setup
    http://127.0.0.1:5000/callback  (or https://YOUR-APP-URL/callback once hosted)
 3. Set SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET. Optional: REDIRECT_URI, FLASK_SECRET,
    COOKIES_FILE (path to a Netscape cookies.txt; needed for most Instagram reels),
-   MAX_SAMPLES (default 8), MAX_UPLOAD_MB (default 100).
+   MAX_SAMPLES (default 60), MAX_UPLOAD_MB (default 100).
 4. Recognition is free via Shazam (shazamio, no key). If AUDD_API_TOKEN is set, AudD is used instead.
 5. python app.py -> http://127.0.0.1:5000
 """
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import io
 import math
 import os
@@ -34,8 +35,9 @@ from yt_dlp.utils import match_filter_func
 
 REDIRECT_URI = os.environ.get("REDIRECT_URI", "http://127.0.0.1:5000/callback")
 SCOPE = "playlist-read-private playlist-modify-private playlist-modify-public"
-MAX_SAMPLES = int(os.environ.get("MAX_SAMPLES", 8))
-WINDOW_SECS, STEP_SECS, MAX_AUDIO_SECS = 10, 15, 300
+MAX_SAMPLES = int(os.environ.get("MAX_SAMPLES", 60))
+WORKERS = int(os.environ.get("RECOGNIZE_WORKERS", 4))
+WINDOW_SECS, STEP_SECS, MAX_AUDIO_SECS = 10, 7, 600  # 10 s clips every 7 s, so clips overlap
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET") or secrets.token_hex(16)
@@ -118,8 +120,8 @@ def slice_windows(wav_path):
     with wave.open(str(wav_path)) as w:
         rate, total = w.getframerate(), w.getnframes()
         win = rate * WINDOW_SECS
-        n = min(MAX_SAMPLES, max(1, math.ceil(total / rate / STEP_SECS)))
         last_start = max(total - win, 0)
+        n = min(MAX_SAMPLES, math.ceil(last_start / (rate * STEP_SECS)) + 1)
         for i in range(n):
             start = 0 if n == 1 else int(i * last_start / (n - 1))
             w.setpos(start)
@@ -134,29 +136,55 @@ def slice_windows(wav_path):
     return clips
 
 
-def recognize(wav_bytes):
-    """Return {'title','artist', optional 'spotify': {'uri'}} or None."""
-    token = os.environ.get("AUDD_API_TOKEN")
-    if token:
-        r = requests.post(
-            "https://api.audd.io/",
-            data={"api_token": token, "return": "spotify"},
-            files={"file": ("clip.wav", wav_bytes)},
-            timeout=60,
-        )
-        r.raise_for_status()
-        return r.json().get("result")
-
-    from shazamio import Shazam  # free, no key
-
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "clip.wav"
-        path.write_bytes(wav_bytes)
-        shazam = Shazam()
-        fn = getattr(shazam, "recognize", None) or shazam.recognize_song
-        out = asyncio.run(fn(str(path)))
+def _track(out):
     track = (out or {}).get("track")
     return {"title": track["title"], "artist": track["subtitle"]} if track else None
+
+
+async def _shazam_all(clips):
+    from shazamio import Shazam  # free, no key
+
+    shazam, gate = Shazam(), asyncio.Semaphore(WORKERS)
+    call = getattr(shazam, "recognize", None) or shazam.recognize_song
+
+    async def one(clip, folder, i):
+        path = Path(folder) / f"clip{i}.wav"
+        path.write_bytes(clip)
+        err = None
+        async with gate:
+            for _ in range(2):  # one retry for flaky responses
+                try:
+                    return _track(await call(str(path)))
+                except Exception as e:
+                    err = e
+                    await asyncio.sleep(1)
+        return err
+
+    with tempfile.TemporaryDirectory() as folder:
+        return await asyncio.gather(*(one(c, folder, i) for i, c in enumerate(clips)))
+
+
+def recognize_all(clips):
+    """Recognize clips in parallel. Returns one entry per clip, in order:
+    a hit dict, None (no match) or an Exception (that clip failed)."""
+    token = os.environ.get("AUDD_API_TOKEN")
+    if token:
+        def one(clip):
+            try:
+                r = requests.post(
+                    "https://api.audd.io/",
+                    data={"api_token": token, "return": "spotify"},
+                    files={"file": ("clip.wav", clip)},
+                    timeout=60,
+                )
+                r.raise_for_status()
+                return r.json().get("result")
+            except Exception as e:
+                return e
+
+        with ThreadPoolExecutor(WORKERS) as pool:
+            return list(pool.map(one, clips))
+    return asyncio.run(_shazam_all(clips))
 
 
 def spotify_uri(sp, hit):
@@ -202,13 +230,10 @@ def playlists():
 def identify_and_add(sp, playlist_id, wav):
     clips = slice_windows(wav)
     hits, failures = {}, 0
-    for clip in clips:
-        try:
-            hit = recognize(clip)
-        except Exception:
+    for hit in recognize_all(clips):
+        if isinstance(hit, Exception):
             failures += 1
-            continue
-        if hit:
+        elif hit:
             hits.setdefault((hit["title"].lower(), hit["artist"].lower()), hit)
 
     if not hits:
@@ -374,12 +399,12 @@ $('go').onclick=async()=>{
     let r;
     if(mode==='file'){
       const f=$('file').files[0]; if(!f)return say('Choose a video file first.','bad');
-      say('Uploading and listening… this can take up to a minute.');
+      say('Uploading and listening… this can take a minute or two for long videos.');
       const fd=new FormData(); fd.append('video',f); fd.append('playlist_id',pl.value);
       r=await fetch('/api/upload',{method:'POST',body:fd});
     }else{
       if(!$('url').value.trim())return say('Paste a video link first.','bad');
-      say('Fetching the video and listening… this can take up to a minute.');
+      say('Fetching the video and listening… this can take a minute or two for long videos.');
       r=await fetch('/api/add',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({url:$('url').value,playlist_id:pl.value})});
     }
