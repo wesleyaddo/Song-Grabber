@@ -4,4 +4,4 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
-CMD gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --timeout 240 --workers 1
+CMD gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 1 --worker-class gthread --threads 8 --timeout 120

@@ -18,6 +18,9 @@ import io
 import math
 import os
 import secrets
+import shutil
+import threading
+import time
 import subprocess
 import tempfile
 import wave
@@ -37,6 +40,8 @@ REDIRECT_URI = os.environ.get("REDIRECT_URI", "http://127.0.0.1:5000/callback")
 SCOPE = "playlist-read-private playlist-modify-private playlist-modify-public"
 MAX_SAMPLES = int(os.environ.get("MAX_SAMPLES", 60))
 WORKERS = int(os.environ.get("RECOGNIZE_WORKERS", 4))
+CLIP_TIMEOUT = 25  # seconds to wait for one clip
+BUDGET_SECS = int(os.environ.get("RECOGNIZE_BUDGET_SECS", 240))  # stop listening after this long
 WINDOW_SECS, STEP_SECS, MAX_AUDIO_SECS = 10, 7, 600  # 10 s clips every 7 s, so clips overlap
 
 app = Flask(__name__)
@@ -56,9 +61,10 @@ def oauth():
 
 def spotify():
     auth = oauth()
-    if not auth.validate_token(auth.cache_handler.get_cached_token()):
+    token = auth.validate_token(auth.cache_handler.get_cached_token())
+    if not token:
         return None
-    return spotipy.Spotify(auth_manager=auth)
+    return spotipy.Spotify(auth=token["access_token"])
 
 
 def to_wav(src, folder):
@@ -141,31 +147,38 @@ def _track(out):
     return {"title": track["title"], "artist": track["subtitle"]} if track else None
 
 
-async def _shazam_all(clips):
+async def _shazam_all(clips, job):
     from shazamio import Shazam  # free, no key
 
     shazam, gate = Shazam(), asyncio.Semaphore(WORKERS)
     call = getattr(shazam, "recognize", None) or shazam.recognize_song
+    deadline = time.monotonic() + BUDGET_SECS
 
     async def one(clip, folder, i):
-        path = Path(folder) / f"clip{i}.wav"
-        path.write_bytes(clip)
-        err = None
-        async with gate:
-            for _ in range(2):  # one retry for flaky responses
-                try:
-                    return _track(await call(str(path)))
-                except Exception as e:
-                    err = e
-                    await asyncio.sleep(1)
-        return err
+        try:
+            path = Path(folder) / f"clip{i}.wav"
+            path.write_bytes(clip)
+            err = None
+            async with gate:
+                if time.monotonic() > deadline:
+                    job["skipped"] = job.get("skipped", 0) + 1
+                    return TimeoutError("time budget used up")
+                for _ in range(2):  # one retry for flaky responses
+                    try:
+                        return _track(await asyncio.wait_for(call(str(path)), CLIP_TIMEOUT))
+                    except Exception as e:
+                        err = e
+                        await asyncio.sleep(1)
+            return err
+        finally:
+            job["done"] += 1
 
     with tempfile.TemporaryDirectory() as folder:
         return await asyncio.gather(*(one(c, folder, i) for i, c in enumerate(clips)))
 
 
-def recognize_all(clips):
-    """Recognize clips in parallel. Returns one entry per clip, in order:
+def recognize_all(clips, job):
+    """Recognize clips in parallel. One entry per clip, in order:
     a hit dict, None (no match) or an Exception (that clip failed)."""
     token = os.environ.get("AUDD_API_TOKEN")
     if token:
@@ -175,16 +188,18 @@ def recognize_all(clips):
                     "https://api.audd.io/",
                     data={"api_token": token, "return": "spotify"},
                     files={"file": ("clip.wav", clip)},
-                    timeout=60,
+                    timeout=CLIP_TIMEOUT,
                 )
                 r.raise_for_status()
                 return r.json().get("result")
             except Exception as e:
                 return e
+            finally:
+                job["done"] += 1
 
         with ThreadPoolExecutor(WORKERS) as pool:
             return list(pool.map(one, clips))
-    return asyncio.run(_shazam_all(clips))
+    return asyncio.run(_shazam_all(clips, job))
 
 
 def spotify_uri(sp, hit):
@@ -227,10 +242,38 @@ def playlists():
     return jsonify(playlists=items)
 
 
-def identify_and_add(sp, playlist_id, wav):
+class JobError(Exception):
+    """A problem worth showing to the person as-is."""
+
+
+JOBS = {}  # kept in memory; fine because the server runs a single worker process
+
+
+def start_job(target, *args):
+    now = time.time()
+    for old in [k for k, j in JOBS.items() if now - j["t"] > 3600]:
+        del JOBS[old]
+    job_id = secrets.token_urlsafe(8)
+    job = JOBS[job_id] = {"state": "running", "stage": "Starting", "done": 0, "total": 0, "t": now}
+
+    def run():
+        try:
+            job["results"] = target(job, *args)
+            job["state"] = "done"
+        except JobError as e:
+            job.update(state="error", error=str(e))
+        except Exception as e:
+            job.update(state="error", error=f"Unexpected error: {str(e)[:200]}")
+
+    threading.Thread(target=run, daemon=True).start()
+    return job_id
+
+
+def identify_and_add(job, sp, playlist_id, wav):
     clips = slice_windows(wav)
+    job.update(stage="Listening", total=len(clips), done=0)
     hits, failures = {}, 0
-    for hit in recognize_all(clips):
+    for hit in recognize_all(clips, job):
         if isinstance(hit, Exception):
             failures += 1
         elif hit:
@@ -238,9 +281,10 @@ def identify_and_add(sp, playlist_id, wav):
 
     if not hits:
         if failures == len(clips):
-            return jsonify(error="Song recognition failed. Try again in a moment."), 502
-        return jsonify(error="No songs recognized. The audio may be original sound or too quiet."), 404
+            raise JobError("Song recognition failed or timed out. Try again in a moment.")
+        raise JobError("No songs recognized. The audio may be original sound or too quiet.")
 
+    job["stage"] = "Adding to Spotify"
     page, existing = sp.playlist_items(playlist_id, fields="items(track(uri)),next", limit=100), set()
     while page:
         existing |= {i["track"]["uri"] for i in page["items"] if i.get("track")}
@@ -260,7 +304,31 @@ def identify_and_add(sp, playlist_id, wav):
         results.append(item)
     if to_add:
         sp.playlist_add_items(playlist_id, to_add)
-    return jsonify(results=results)
+    return results
+
+
+def link_task(job, sp, playlist_id, url):
+    with tempfile.TemporaryDirectory() as tmp:
+        job["stage"] = "Fetching the video"
+        try:
+            wav = fetch_audio(url, tmp)
+        except subprocess.CalledProcessError:
+            raise JobError("That video has no audio I can read.")
+        except Exception as e:
+            raise JobError(f"Couldn't get that video: {str(e)[:300]}")
+        return identify_and_add(job, sp, playlist_id, wav)
+
+
+def file_task(job, sp, playlist_id, folder):
+    try:  # the uploaded file is deleted when this finishes
+        job["stage"] = "Reading the file"
+        try:
+            wav = to_wav(Path(folder) / "upload.bin", folder)
+        except subprocess.CalledProcessError:
+            raise JobError("I couldn't read audio from that file.")
+        return identify_and_add(job, sp, playlist_id, wav)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 @app.route("/api/add", methods=["POST"])
@@ -272,14 +340,7 @@ def add():
     url, playlist_id = body.get("url", "").strip(), body.get("playlist_id")
     if not url or not playlist_id:
         return jsonify(error="Paste a video link and pick a playlist."), 400
-    with tempfile.TemporaryDirectory() as tmp:
-        try:
-            wav = fetch_audio(url, tmp)
-        except subprocess.CalledProcessError:
-            return jsonify(error="That video has no audio I can read."), 422
-        except Exception as e:
-            return jsonify(error=f"Couldn't get that video: {str(e)[:300]}"), 422
-        return identify_and_add(sp, playlist_id, wav)
+    return jsonify(job=start_job(link_task, sp, playlist_id, url))
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -290,14 +351,17 @@ def upload():
     video, playlist_id = request.files.get("video"), request.form.get("playlist_id")
     if not video or not playlist_id:
         return jsonify(error="Choose a file and a playlist."), 400
-    with tempfile.TemporaryDirectory() as tmp:  # deleted as soon as this request ends
-        src = Path(tmp) / "upload.bin"
-        video.save(src)
-        try:
-            wav = to_wav(src, tmp)
-        except subprocess.CalledProcessError:
-            return jsonify(error="I couldn't read audio from that file."), 422
-        return identify_and_add(sp, playlist_id, wav)
+    folder = tempfile.mkdtemp()
+    video.save(Path(folder) / "upload.bin")
+    return jsonify(job=start_job(file_task, sp, playlist_id, folder))
+
+
+@app.route("/api/job/<job_id>")
+def job_status(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify(error="That job is gone (the server may have restarted). Please try again."), 404
+    return jsonify({k: v for k, v in job.items() if k != "t"})
 
 
 @app.errorhandler(413)
@@ -392,6 +456,20 @@ function renderHist(){
 }
 $('clear').onclick=()=>{if(confirm('Clear the history on this device?')){saveHist([]);renderHist()}};
 
+async function waitFor(id){
+  let misses=0;
+  for(;;){
+    await new Promise(r=>setTimeout(r,1500));
+    let r,d;
+    try{r=await fetch('/api/job/'+id); d=await r.json()}
+    catch(e){if(++misses>8)throw new Error('Lost connection to the server.'); continue}
+    misses=0;
+    if(!r.ok)throw new Error(d.error);
+    if(d.state!=='running')return d;
+    say(d.total?`${d.stage}… ${d.done} of ${d.total} clips checked`:d.stage+'…');
+  }
+}
+
 $('go').onclick=async()=>{
   const b=$('go'), pl=$('pl'); b.disabled=true;
   try{localStorage.setItem('pl',pl.value)}catch(e){}
@@ -399,28 +477,33 @@ $('go').onclick=async()=>{
     let r;
     if(mode==='file'){
       const f=$('file').files[0]; if(!f)return say('Choose a video file first.','bad');
-      say('Uploading and listening… this can take a minute or two for long videos.');
+      say('Uploading…');
       const fd=new FormData(); fd.append('video',f); fd.append('playlist_id',pl.value);
       r=await fetch('/api/upload',{method:'POST',body:fd});
     }else{
       if(!$('url').value.trim())return say('Paste a video link first.','bad');
-      say('Fetching the video and listening… this can take a minute or two for long videos.');
+      say('Starting…');
       r=await fetch('/api/add',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({url:$('url').value,playlist_id:pl.value})});
     }
-    const d=await r.json();
-    if(!r.ok)return say(d.error,'bad');
-    const ul=document.createElement('ul');
+    const start=await r.json();
+    if(!r.ok)return say(start.error,'bad');
+    const d=await waitFor(start.job);
+    if(d.state==='error')return say(d.error,'bad');
+    const box=document.createElement('div'), ul=document.createElement('ul');
     for(const s of d.results){
       const li=document.createElement('li'), t=document.createElement('strong'), m=document.createElement('span');
       t.textContent=s.title; m.textContent=s.artist+' · '+LABEL[s.status][0]; m.className=LABEL[s.status][1];
       li.append(t,m); ul.append(li);
     }
-    out.className=''; out.replaceChildren(ul);
+    box.append(ul);
+    if(d.skipped){const n=document.createElement('p'); n.className='mute';
+      n.textContent=`Stopped early: ${d.skipped} of ${d.total} clips weren't checked, so some songs may be missing.`; box.append(n)}
+    out.className=''; out.replaceChildren(box);
     const src=mode==='file'?'upload':'link', plName=pl.selectedOptions[0].text, at=Date.now();
     saveHist([...d.results.map(s=>({...s,source:src,playlist:plName,at})),...loadHist()]);
     renderHist(); $('url').value=''; $('file').value='';
-  }catch(e){say('Something went wrong. Check that the app is still running.','bad')}
+  }catch(e){say(e.message||'Something went wrong.','bad')}
   finally{b.disabled=false}
 };
 renderHist();
