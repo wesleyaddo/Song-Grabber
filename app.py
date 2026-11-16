@@ -43,7 +43,13 @@ WORKERS = int(os.environ.get("RECOGNIZE_WORKERS", 4))
 CLIP_TIMEOUT = 25  # seconds to wait for one clip
 BUDGET_SECS = int(os.environ.get("RECOGNIZE_BUDGET_SECS", 240))  # stop listening after this long
 WINDOW_SECS, MAX_AUDIO_SECS = 10, 600
-STEPS = {"fast": 15, "balanced": 10, "thorough": 7}  # seconds between the starts of 10 s clips
+# name: (seconds between clip starts, maximum number of clips)
+PRESETS = {
+    "fastest": (15, 8),
+    "fast": (15, MAX_SAMPLES),
+    "balanced": (10, MAX_SAMPLES),
+    "thorough": (7, MAX_SAMPLES),
+}
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET") or secrets.token_hex(16)
@@ -121,14 +127,15 @@ def fetch_audio(url, folder):
     return to_wav(sources[0], folder)
 
 
-def slice_windows(wav_path, step):
+def slice_windows(wav_path, preset):
     """Cut short clips spread evenly across the audio."""
+    step, cap = preset
     clips = []
     with wave.open(str(wav_path)) as w:
         rate, total = w.getframerate(), w.getnframes()
         win = rate * WINDOW_SECS
         last_start = max(total - win, 0)
-        n = min(MAX_SAMPLES, math.ceil(last_start / (rate * step)) + 1)
+        n = min(cap, math.ceil(last_start / (rate * step)) + 1)
         for i in range(n):
             start = 0 if n == 1 else int(i * last_start / (n - 1))
             w.setpos(start)
@@ -279,8 +286,8 @@ def safe_uri(sp, hit):
         return None
 
 
-def identify_and_add(job, sp, playlist_id, wav, step):
-    clips = slice_windows(wav, step)
+def identify_and_add(job, sp, playlist_id, wav, preset):
+    clips = slice_windows(wav, preset)
     job.update(stage="Listening", total=len(clips), done=0)
     t = time.monotonic()
     hits, failures = {}, 0
@@ -324,7 +331,7 @@ def identify_and_add(job, sp, playlist_id, wav, step):
     return results
 
 
-def link_task(job, sp, playlist_id, url, step):
+def link_task(job, sp, playlist_id, url, preset):
     with tempfile.TemporaryDirectory() as tmp:
         job["stage"] = "Fetching the video"
         t = time.monotonic()
@@ -335,10 +342,10 @@ def link_task(job, sp, playlist_id, url, step):
         except Exception as e:
             raise JobError(f"Couldn't get that video: {str(e)[:300]}")
         job["timings"]["fetch"] = round(time.monotonic() - t, 1)
-        return identify_and_add(job, sp, playlist_id, wav, step)
+        return identify_and_add(job, sp, playlist_id, wav, preset)
 
 
-def file_task(job, sp, playlist_id, folder, step):
+def file_task(job, sp, playlist_id, folder, preset):
     try:  # the uploaded file is deleted when this finishes
         job["stage"] = "Reading the file"
         t = time.monotonic()
@@ -347,7 +354,7 @@ def file_task(job, sp, playlist_id, folder, step):
         except subprocess.CalledProcessError:
             raise JobError("I couldn't read audio from that file.")
         job["timings"]["fetch"] = round(time.monotonic() - t, 1)
-        return identify_and_add(job, sp, playlist_id, wav, step)
+        return identify_and_add(job, sp, playlist_id, wav, preset)
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 
@@ -361,8 +368,8 @@ def add():
     url, playlist_id = body.get("url", "").strip(), body.get("playlist_id")
     if not url or not playlist_id:
         return jsonify(error="Paste a video link and pick a playlist."), 400
-    step = STEPS.get(body.get("speed"), STEPS["balanced"])
-    return jsonify(job=start_job(link_task, sp, playlist_id, url, step))
+    preset = PRESETS.get(body.get("speed"), PRESETS["balanced"])
+    return jsonify(job=start_job(link_task, sp, playlist_id, url, preset))
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -375,8 +382,8 @@ def upload():
         return jsonify(error="Choose a file and a playlist."), 400
     folder = tempfile.mkdtemp()
     video.save(Path(folder) / "upload.bin")
-    step = STEPS.get(request.form.get("speed"), STEPS["balanced"])
-    return jsonify(job=start_job(file_task, sp, playlist_id, folder, step))
+    preset = PRESETS.get(request.form.get("speed"), PRESETS["balanced"])
+    return jsonify(job=start_job(file_task, sp, playlist_id, folder, preset))
 
 
 @app.route("/api/job/<job_id>")
@@ -442,6 +449,7 @@ h2{font-size:1.4rem;margin:2.4rem 0 .4rem}#clear{margin-top:1rem;font-weight:400
   <select id="pl"></select>
   <label for="speed">Detail</label>
   <select id="speed">
+    <option value="fastest">Fastest (8 clips at most, may miss songs)</option>
     <option value="fast">Fast (checks every 15 seconds)</option>
     <option value="balanced" selected>Balanced (every 10 seconds)</option>
     <option value="thorough">Thorough (every 7 seconds)</option>
