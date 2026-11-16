@@ -42,7 +42,8 @@ MAX_SAMPLES = int(os.environ.get("MAX_SAMPLES", 60))
 WORKERS = int(os.environ.get("RECOGNIZE_WORKERS", 4))
 CLIP_TIMEOUT = 25  # seconds to wait for one clip
 BUDGET_SECS = int(os.environ.get("RECOGNIZE_BUDGET_SECS", 240))  # stop listening after this long
-WINDOW_SECS, STEP_SECS, MAX_AUDIO_SECS = 10, 7, 600  # 10 s clips every 7 s, so clips overlap
+WINDOW_SECS, MAX_AUDIO_SECS = 10, 600
+STEPS = {"fast": 15, "balanced": 10, "thorough": 7}  # seconds between the starts of 10 s clips
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET") or secrets.token_hex(16)
@@ -97,7 +98,7 @@ def fetch_audio(url, folder):
     """Fetch a video's audio into a temp folder and convert it to wav."""
     url = clean_url(url)
     opts = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[abr<=?130]/worstaudio/worst",  # small files download faster
         "outtmpl": str(Path(folder) / "src.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
@@ -120,14 +121,14 @@ def fetch_audio(url, folder):
     return to_wav(sources[0], folder)
 
 
-def slice_windows(wav_path):
+def slice_windows(wav_path, step):
     """Cut short clips spread evenly across the audio."""
     clips = []
     with wave.open(str(wav_path)) as w:
         rate, total = w.getframerate(), w.getnframes()
         win = rate * WINDOW_SECS
         last_start = max(total - win, 0)
-        n = min(MAX_SAMPLES, math.ceil(last_start / (rate * STEP_SECS)) + 1)
+        n = min(MAX_SAMPLES, math.ceil(last_start / (rate * step)) + 1)
         for i in range(n):
             start = 0 if n == 1 else int(i * last_start / (n - 1))
             w.setpos(start)
@@ -254,11 +255,13 @@ def start_job(target, *args):
     for old in [k for k, j in JOBS.items() if now - j["t"] > 3600]:
         del JOBS[old]
     job_id = secrets.token_urlsafe(8)
-    job = JOBS[job_id] = {"state": "running", "stage": "Starting", "done": 0, "total": 0, "t": now}
+    job = JOBS[job_id] = {"state": "running", "stage": "Starting", "done": 0, "total": 0, "t": now, "timings": {}}
 
     def run():
         try:
             job["results"] = target(job, *args)
+            job["timings"]["total"] = round(time.time() - job["t"], 1)
+            print("job finished:", job["timings"], flush=True)  # visible in Render Logs
             job["state"] = "done"
         except JobError as e:
             job.update(state="error", error=str(e))
@@ -269,15 +272,24 @@ def start_job(target, *args):
     return job_id
 
 
-def identify_and_add(job, sp, playlist_id, wav):
-    clips = slice_windows(wav)
+def safe_uri(sp, hit):
+    try:
+        return spotify_uri(sp, hit)
+    except Exception:
+        return None
+
+
+def identify_and_add(job, sp, playlist_id, wav, step):
+    clips = slice_windows(wav, step)
     job.update(stage="Listening", total=len(clips), done=0)
+    t = time.monotonic()
     hits, failures = {}, 0
     for hit in recognize_all(clips, job):
         if isinstance(hit, Exception):
             failures += 1
         elif hit:
             hits.setdefault((hit["title"].lower(), hit["artist"].lower()), hit)
+    job["timings"]["listen"] = round(time.monotonic() - t, 1)
 
     if not hits:
         if failures == len(clips):
@@ -285,15 +297,19 @@ def identify_and_add(job, sp, playlist_id, wav):
         raise JobError("No songs recognized. The audio may be original sound or too quiet.")
 
     job["stage"] = "Adding to Spotify"
+    t = time.monotonic()
     page, existing = sp.playlist_items(playlist_id, fields="items(track(uri)),next", limit=100), set()
     while page:
         existing |= {i["track"]["uri"] for i in page["items"] if i.get("track")}
         page = sp.next(page) if page.get("next") else None
 
+    found = list(hits.values())
+    with ThreadPoolExecutor(4) as pool:  # look the songs up on Spotify in parallel
+        uris = list(pool.map(lambda h: safe_uri(sp, h), found))
+
     results, to_add = [], []
-    for hit in hits.values():
+    for hit, uri in zip(found, uris):
         item = {"title": hit["title"], "artist": hit["artist"]}
-        uri = spotify_uri(sp, hit)
         if not uri:
             item["status"] = "not_found"
         elif uri in existing or uri in to_add:
@@ -304,29 +320,34 @@ def identify_and_add(job, sp, playlist_id, wav):
         results.append(item)
     if to_add:
         sp.playlist_add_items(playlist_id, to_add)
+    job["timings"]["spotify"] = round(time.monotonic() - t, 1)
     return results
 
 
-def link_task(job, sp, playlist_id, url):
+def link_task(job, sp, playlist_id, url, step):
     with tempfile.TemporaryDirectory() as tmp:
         job["stage"] = "Fetching the video"
+        t = time.monotonic()
         try:
             wav = fetch_audio(url, tmp)
         except subprocess.CalledProcessError:
             raise JobError("That video has no audio I can read.")
         except Exception as e:
             raise JobError(f"Couldn't get that video: {str(e)[:300]}")
-        return identify_and_add(job, sp, playlist_id, wav)
+        job["timings"]["fetch"] = round(time.monotonic() - t, 1)
+        return identify_and_add(job, sp, playlist_id, wav, step)
 
 
-def file_task(job, sp, playlist_id, folder):
+def file_task(job, sp, playlist_id, folder, step):
     try:  # the uploaded file is deleted when this finishes
         job["stage"] = "Reading the file"
+        t = time.monotonic()
         try:
             wav = to_wav(Path(folder) / "upload.bin", folder)
         except subprocess.CalledProcessError:
             raise JobError("I couldn't read audio from that file.")
-        return identify_and_add(job, sp, playlist_id, wav)
+        job["timings"]["fetch"] = round(time.monotonic() - t, 1)
+        return identify_and_add(job, sp, playlist_id, wav, step)
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 
@@ -340,7 +361,8 @@ def add():
     url, playlist_id = body.get("url", "").strip(), body.get("playlist_id")
     if not url or not playlist_id:
         return jsonify(error="Paste a video link and pick a playlist."), 400
-    return jsonify(job=start_job(link_task, sp, playlist_id, url))
+    step = STEPS.get(body.get("speed"), STEPS["balanced"])
+    return jsonify(job=start_job(link_task, sp, playlist_id, url, step))
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -353,7 +375,8 @@ def upload():
         return jsonify(error="Choose a file and a playlist."), 400
     folder = tempfile.mkdtemp()
     video.save(Path(folder) / "upload.bin")
-    return jsonify(job=start_job(file_task, sp, playlist_id, folder))
+    step = STEPS.get(request.form.get("speed"), STEPS["balanced"])
+    return jsonify(job=start_job(file_task, sp, playlist_id, folder, step))
 
 
 @app.route("/api/job/<job_id>")
@@ -417,6 +440,12 @@ h2{font-size:1.4rem;margin:2.4rem 0 .4rem}#clear{margin-top:1rem;font-weight:400
   </div>
   <label for="pl">Playlist</label>
   <select id="pl"></select>
+  <label for="speed">Detail</label>
+  <select id="speed">
+    <option value="fast">Fast (checks every 15 seconds)</option>
+    <option value="balanced" selected>Balanced (every 10 seconds)</option>
+    <option value="thorough">Thorough (every 7 seconds)</option>
+  </select>
   <button id="go">Find songs and add them</button>
 </div>
 <div id="out" role="status" aria-live="polite"></div>
@@ -478,13 +507,13 @@ $('go').onclick=async()=>{
     if(mode==='file'){
       const f=$('file').files[0]; if(!f)return say('Choose a video file first.','bad');
       say('Uploading…');
-      const fd=new FormData(); fd.append('video',f); fd.append('playlist_id',pl.value);
+      const fd=new FormData(); fd.append('video',f); fd.append('playlist_id',pl.value); fd.append('speed',$('speed').value);
       r=await fetch('/api/upload',{method:'POST',body:fd});
     }else{
       if(!$('url').value.trim())return say('Paste a video link first.','bad');
       say('Starting…');
       r=await fetch('/api/add',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({url:$('url').value,playlist_id:pl.value})});
+        body:JSON.stringify({url:$('url').value,playlist_id:pl.value,speed:$('speed').value})});
     }
     const start=await r.json();
     if(!r.ok)return say(start.error,'bad');
@@ -499,6 +528,8 @@ $('go').onclick=async()=>{
     box.append(ul);
     if(d.skipped){const n=document.createElement('p'); n.className='mute';
       n.textContent=`Stopped early: ${d.skipped} of ${d.total} clips weren't checked, so some songs may be missing.`; box.append(n)}
+    if(d.timings&&d.timings.total!==undefined){const t=document.createElement('p'); t.className='mute';
+      t.textContent=`Finished in ${d.timings.total}s (fetch ${d.timings.fetch}s, listening ${d.timings.listen}s, Spotify ${d.timings.spotify}s).`; box.append(t)}
     out.className=''; out.replaceChildren(box);
     const src=mode==='file'?'upload':'link', plName=pl.selectedOptions[0].text, at=Date.now();
     saveHist([...d.results.map(s=>({...s,source:src,playlist:plName,at})),...loadHist()]);
